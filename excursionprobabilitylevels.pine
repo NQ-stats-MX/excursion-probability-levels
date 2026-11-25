@@ -1,0 +1,426 @@
+//@version=6
+indicator(
+     "Excursion Probability Levels",
+     shorttitle = "ExcProb",
+     overlay = true,
+     max_labels_count = 50
+)
+
+// ============================================================================
+// WHAT THIS DOES
+// ============================================================================
+//
+// Levels defined by the probability that price TOUCHES them before the
+// session ends (first passage), not by where price ends the session.
+//
+// For a driftless diffusion in log price with remaining variance V,
+// the reflection principle (heat equation with an absorbing barrier) gives
+//
+//     P(touch a level at log-distance d before the end) = 2 * (1 - Phi(d / sqrt(V)))
+//
+// so the level with touch probability p sits at d = Phi^-1(1 - p/2) * sqrt(V).
+//
+// V comes from a VOLATILITY CLOCK: an intraday profile of per-bar variance
+// (Parkinson high-low estimator), learned bucket by bucket (bar 0 of the
+// session, bar 1, ...) as an exponentially weighted average across sessions.
+// Remaining variance = sum of the profile over the bars still to come.
+//
+// With "Scale by implied vol" on, the profile is stored per unit of implied
+// variance (VOLI^2) and multiplied by the current VOLI^2, so the SHAPE comes
+// from history and the LEVEL from today's implied vol. This also makes the
+// profile usable with only a few sessions of history.
+//
+// Anchored levels: computed once at the session open, from the open price
+//                  and the full-session variance. They stay fixed.
+// Session open:    horizontal line at the session open price.
+// Mean excursion:  E[max excursion] = sigma * sqrt(2/pi) (~0.80 sigma) on each
+//                  side of the open. Touch probability ~42.5%.
+// Rolling cone:    recomputed every bar from the current close and the
+//                  variance still to come. Shrinks into the close.
+// Live labels:     current probability that each anchored level, and the
+//                  session high/low, gets touched before the session ends.
+// Calibration:     per session, did price actually touch each anchored level?
+//                  Compares the model's p with the realized frequency.
+// ============================================================================
+
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+
+gS = "Session"
+
+sessInput = input.session("0930-1600", "Session", group = gS,
+     tooltip = "Session whose excursions are measured. The chart must have bars outside this session (e.g. NQ with extended hours) so its start and end can be detected.")
+tzInput   = input.string("America/New_York", "Timezone", group = gS)
+
+gP = "Touch probabilities"
+
+p1 = input.float(50.0, "Level 1 (%)", minval = 1.0, maxval = 99.0, step = 5.0, group = gP)
+p2 = input.float(25.0, "Level 2 (%)", minval = 1.0, maxval = 99.0, step = 5.0, group = gP)
+p3 = input.float(10.0, "Level 3 (%)", minval = 1.0, maxval = 99.0, step = 5.0, group = gP,
+     tooltip = "Each level is drawn on both sides. The % is the one-sided chance of being touched before the session ends, e.g. 25% = the upper level gets tagged in about 1 session out of 4.")
+
+gV = "Volatility"
+
+useVoli   = input.bool(true, "Scale by implied vol", group = gV,
+     tooltip = "On: intraday shape from history, level from today's implied vol. Off: pure realized profile (reacts to regime changes only as sessions roll in).")
+volSymbol = input.symbol("NASDAQ:VOLI", "Implied vol symbol", group = gV)
+lookback  = input.int(20, "Profile memory (sessions)", minval = 2, maxval = 200, group = gV,
+     tooltip = "Exponential averaging span for the intraday variance profile, in sessions.")
+
+gD = "Display"
+
+showStatic = input.bool(true,  "Anchored levels (from session open)", group = gD)
+showCone   = input.bool(false, "Rolling cone (from current price)",   group = gD)
+showLive   = input.bool(true,  "Live touch probability labels",        group = gD)
+showHL     = input.bool(true,  "Session high/low take-out probability", group = gD)
+showCal    = input.bool(true,  "Calibration table",                    group = gD)
+showOpen   = input.bool(true,  "Session open line",                    group = gD)
+showMean   = input.bool(true,  "Mean excursion levels",                group = gD,
+     tooltip = "Expected session excursion on each side of the open: sigma * sqrt(2/pi), about 0.80 sigma. Its touch probability is about 42.5%.")
+cUp        = input.color(color.teal,            "Upper levels", group = gD)
+cDn        = input.color(color.rgb(145, 85, 190), "Lower levels", group = gD)
+cOpen      = input.color(color.gray,   "Open line",       group = gD)
+cMean      = input.color(color.orange, "Mean excursion",  group = gD)
+
+int   MIN_SESS = 2                        // sessions needed in the profile before levels are drawn
+float K_MEAN   = math.sqrt(2.0 / math.pi) // E[max excursion] = K_MEAN * sigma
+
+
+// ============================================================================
+// MATH HELPERS
+// ============================================================================
+
+// Inverse standard normal CDF (Acklam's rational approximation, ~1e-9 rel. error)
+f_invnorm(float p) =>
+    float a1 = -3.969683028665376e+01
+    float a2 =  2.209460984245205e+02
+    float a3 = -2.759285104469687e+02
+    float a4 =  1.383577518672690e+02
+    float a5 = -3.066479806614716e+01
+    float a6 =  2.506628277459239e+00
+    float b1 = -5.447609879822406e+01
+    float b2 =  1.615858368580409e+02
+    float b3 = -1.556989798598866e+02
+    float b4 =  6.680131188771972e+01
+    float b5 = -1.328068155288572e+01
+    float c1 = -7.784894002430293e-03
+    float c2 = -3.223964580411365e-01
+    float c3 = -2.400758277161838e+00
+    float c4 = -2.549732539343734e+00
+    float c5 =  4.374664141464968e+00
+    float c6 =  2.938163982698783e+00
+    float d1 =  7.784695709041462e-03
+    float d2 =  3.224671290700398e-01
+    float d3 =  2.445134137142996e+00
+    float d4 =  3.754408661907416e+00
+    float plow = 0.02425
+    float x = na
+    if p < plow
+        float q = math.sqrt(-2.0 * math.log(p))
+        x := (((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+    else if p <= 1.0 - plow
+        float q = p - 0.5
+        float r = q * q
+        x := (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q / (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+    else
+        float q = math.sqrt(-2.0 * math.log(1.0 - p))
+        x := -(((((c1 * q + c2) * q + c3) * q + c4) * q + c5) * q + c6) / ((((d1 * q + d2) * q + d3) * q + d4) * q + 1.0)
+    x
+
+// Standard normal CDF (Abramowitz & Stegun 7.1.26 erf, ~1e-7 abs. error)
+f_ncdf(float z) =>
+    float x = math.abs(z) / math.sqrt(2.0)
+    float t = 1.0 / (1.0 + 0.3275911 * x)
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * math.exp(-x * x)
+    z >= 0 ? 0.5 * (1.0 + y) : 0.5 * (1.0 - y)
+
+// First-passage probability for a log-distance d >= 0 with remaining sd sig
+f_touch(float d, float sig) =>
+    float r = na
+    if not na(d) and not na(sig)
+        if d <= 0
+            r := 1.0
+        else if sig <= 0
+            r := 0.0
+        else
+            r := 2.0 * (1.0 - f_ncdf(d / sig))
+    r
+
+f_pct(float v) =>
+    na(v) ? "-" : str.tostring(math.round(v * 100.0)) + "%"
+
+// z multipliers for the three probabilities (one-sided touch)
+float z1 = f_invnorm(1.0 - p1 / 200.0)
+float z2 = f_invnorm(1.0 - p2 / 200.0)
+float z3 = f_invnorm(1.0 - p3 / 200.0)
+array<float> zArr = array.from(z1, z2, z3)
+array<float> pArr = array.from(p1, p2, p3)
+
+
+// ============================================================================
+// SESSION DETECTION
+// ============================================================================
+
+bool inSession    = not na(time(timeframe.period, sessInput, tzInput))
+bool sessionStart = inSession and not inSession[1]
+bool sessionEnd   = not inSession and inSession[1]
+
+
+// ============================================================================
+// PER-BAR VARIANCE
+// ============================================================================
+
+float voli = request.security(volSymbol, timeframe.period, close, gaps = barmerge.gaps_off, lookahead = barmerge.lookahead_off)
+float iv   = voli / 100.0
+
+// Parkinson estimator of the bar's log-price variance
+float pv  = high > low ? math.pow(math.log(high / low), 2) / (4.0 * math.log(2.0)) : 0.0
+float pvN = not na(iv) and iv > 0 ? pv / (iv * iv) : na
+
+
+// ============================================================================
+// STATE
+// ============================================================================
+
+var array<float> profR  = array.new_float(0)   // raw variance profile
+var array<float> profN  = array.new_float(0)   // variance per unit implied variance
+var array<float> todayR = array.new_float(0)
+var array<float> todayN = array.new_float(0)
+var array<float> sufR   = array.new_float(0)   // suffix sums: variance from bucket j to the end
+var array<float> sufN   = array.new_float(0)
+
+var int nSessR = 0
+var int nSessN = 0
+var int bIdx   = -1
+
+var bool  sessReady = false
+var float sOpen     = na
+var float sig0      = na
+var float sessH     = na
+var float sessL     = na
+
+var array<int> calN  = array.new_int(3, 0)
+var array<int> calUp = array.new_int(3, 0)
+var array<int> calDn = array.new_int(3, 0)
+
+
+// Remaining variance from bucket i (inclusive) to the end of the session
+f_remVar(int i) =>
+    float v = na
+    bool useN = useVoli and nSessN >= MIN_SESS and not na(iv) and iv > 0
+    if useN
+        int sz = array.size(sufN)
+        if sz > 0
+            v := array.get(sufN, math.min(math.max(i, 0), sz - 1)) * iv * iv
+    else if nSessR >= MIN_SESS
+        int sz = array.size(sufR)
+        if sz > 0
+            v := array.get(sufR, math.min(math.max(i, 0), sz - 1))
+    v
+
+
+// ============================================================================
+// SESSION END: update profile and calibration (once, on a confirmed bar)
+// ============================================================================
+
+if sessionEnd and barstate.isconfirmed
+    float alpha = 2.0 / (lookback + 1.0)
+    int n = array.size(todayR)
+    if n > 0
+        while array.size(profR) < n
+            array.push(profR, na)
+            array.push(profN, na)
+        bool anyN = false
+        for j = 0 to n - 1
+            float xr = array.get(todayR, j)
+            float pr = array.get(profR, j)
+            array.set(profR, j, na(pr) ? xr : pr + alpha * (xr - pr))
+            float xn = array.get(todayN, j)
+            if not na(xn)
+                anyN := true
+                float pn = array.get(profN, j)
+                array.set(profN, j, na(pn) ? xn : pn + alpha * (xn - pn))
+        nSessR += 1
+        if anyN
+            nSessN += 1
+
+    if sessReady and not na(sig0)
+        for k = 0 to 2
+            float z  = array.get(zArr, k)
+            float up = sOpen * math.exp(z * sig0)
+            float dn = sOpen * math.exp(-z * sig0)
+            array.set(calN, k, array.get(calN, k) + 1)
+            if sessH >= up
+                array.set(calUp, k, array.get(calUp, k) + 1)
+            if sessL <= dn
+                array.set(calDn, k, array.get(calDn, k) + 1)
+
+if sessionEnd
+    bIdx := -1
+
+
+// ============================================================================
+// SESSION START: build the volatility clock and lock the anchored levels
+// ============================================================================
+
+if sessionStart
+    // Suffix sums (rebuilt from scratch, so repeated ticks are harmless)
+    array.clear(sufR)
+    array.clear(sufN)
+    int m = array.size(profR)
+    for j = 0 to m
+        array.push(sufR, 0.0)
+        array.push(sufN, 0.0)
+    if m > 0
+        for i = 0 to m - 1
+            int j = m - 1 - i
+            array.set(sufR, j, array.get(sufR, j + 1) + nz(array.get(profR, j)))
+            array.set(sufN, j, array.get(sufN, j + 1) + nz(array.get(profN, j)))
+
+    bIdx  := 0
+    sOpen := open
+    sessH := high
+    sessL := low
+
+    float v0 = f_remVar(0)
+    sig0      := na(v0) ? na : math.sqrt(v0)
+    sessReady := not na(sig0) and sig0 > 0
+
+else if inSession and bIdx >= 0
+    bIdx  += 1
+    sessH := math.max(sessH, high)
+    sessL := math.min(sessL, low)
+
+// Store this bar's variance for the end-of-session profile update
+if inSession and bIdx >= 0 and barstate.isconfirmed
+    if sessionStart
+        array.clear(todayR)
+        array.clear(todayN)
+    array.push(todayR, pv)
+    array.push(todayN, pvN)
+
+
+// ============================================================================
+// REMAINING VARIANCE (bars after the current one)
+// ============================================================================
+
+float remV   = inSession and bIdx >= 0 ? f_remVar(bIdx + 1) : na
+float sigRem = na(remV) ? na : math.sqrt(remV)
+
+
+// ============================================================================
+// PLOTS — ANCHORED LEVELS
+// ============================================================================
+
+bool showS = showStatic and inSession and sessReady and bIdx >= 0
+
+float u1 = showS ? sOpen * math.exp( z1 * sig0) : na
+float d1 = showS ? sOpen * math.exp(-z1 * sig0) : na
+float u2 = showS ? sOpen * math.exp( z2 * sig0) : na
+float d2 = showS ? sOpen * math.exp(-z2 * sig0) : na
+float u3 = showS ? sOpen * math.exp( z3 * sig0) : na
+float d3 = showS ? sOpen * math.exp(-z3 * sig0) : na
+
+plot(u1, "Upper L1", color = cUp,                  style = plot.style_linebr, linewidth = 2)
+plot(d1, "Lower L1", color = cDn,                  style = plot.style_linebr, linewidth = 2)
+plot(u2, "Upper L2", color = color.new(cUp, 30),   style = plot.style_linebr, linewidth = 1)
+plot(d2, "Lower L2", color = color.new(cDn, 30),   style = plot.style_linebr, linewidth = 1)
+plot(u3, "Upper L3", color = color.new(cUp, 55),   style = plot.style_linebr, linewidth = 1)
+plot(d3, "Lower L3", color = color.new(cDn, 55),   style = plot.style_linebr, linewidth = 1)
+
+
+// ============================================================================
+// PLOTS — SESSION OPEN AND MEAN EXCURSION
+// ============================================================================
+
+bool showO = showOpen and inSession and bIdx >= 0 and not na(sOpen)
+bool showM = showMean and inSession and sessReady and bIdx >= 0
+
+plot(showO ? sOpen : na, "Session Open", color = cOpen, style = plot.style_linebr, linewidth = 2)
+plot(showM ? sOpen * math.exp( K_MEAN * sig0) : na, "Mean excursion up",   color = cMean, style = plot.style_linebr, linewidth = 1)
+plot(showM ? sOpen * math.exp(-K_MEAN * sig0) : na, "Mean excursion down", color = cMean, style = plot.style_linebr, linewidth = 1)
+
+
+// ============================================================================
+// PLOTS — ROLLING CONE
+// ============================================================================
+
+bool showC = showCone and inSession and not na(sigRem) and sigRem > 0
+
+plot(showC ? close * math.exp( z1 * sigRem) : na, "Cone upper L1", color = color.new(cUp, 40), style = plot.style_circles, linewidth = 1)
+plot(showC ? close * math.exp(-z1 * sigRem) : na, "Cone lower L1", color = color.new(cDn, 40), style = plot.style_circles, linewidth = 1)
+plot(showC ? close * math.exp( z2 * sigRem) : na, "Cone upper L2", color = color.new(cUp, 60), style = plot.style_circles, linewidth = 1)
+plot(showC ? close * math.exp(-z2 * sigRem) : na, "Cone lower L2", color = color.new(cDn, 60), style = plot.style_circles, linewidth = 1)
+plot(showC ? close * math.exp( z3 * sigRem) : na, "Cone upper L3", color = color.new(cUp, 75), style = plot.style_circles, linewidth = 1)
+plot(showC ? close * math.exp(-z3 * sigRem) : na, "Cone lower L3", color = color.new(cDn, 75), style = plot.style_circles, linewidth = 1)
+
+
+// ============================================================================
+// LIVE LABELS (right edge)
+// ============================================================================
+
+var array<label> lbls = array.new<label>()
+
+f_lbl(float y, string txt, color col) =>
+    label.new(bar_index + 3, y, txt, style = label.style_label_left, color = color.new(color.white, 100), textcolor = col, size = size.small)
+
+if barstate.islast
+    for l in lbls
+        label.delete(l)
+    array.clear(lbls)
+
+    if inSession and bIdx >= 0
+        if showLive and showStatic and sessReady
+            for k = 0 to 2
+                float z  = array.get(zArr, k)
+                float pk = array.get(pArr, k)
+                float up = sOpen * math.exp(z * sig0)
+                float dn = sOpen * math.exp(-z * sig0)
+                string pTxt = str.tostring(pk, "#.#") + "%"
+
+                string upTxt = sessH >= up ? pTxt + " ↑  hit" : pTxt + " ↑  now " + f_pct(f_touch(math.log(up / close), sigRem))
+                string dnTxt = sessL <= dn ? pTxt + " ↓  hit" : pTxt + " ↓  now " + f_pct(f_touch(math.log(close / dn), sigRem))
+
+                array.push(lbls, f_lbl(up, upTxt, cUp))
+                array.push(lbls, f_lbl(dn, dnTxt, cDn))
+
+        if showOpen and not na(sOpen)
+            array.push(lbls, f_lbl(sOpen, "Open", cOpen))
+
+        if showMean and sessReady
+            float mU = sOpen * math.exp( K_MEAN * sig0)
+            float mD = sOpen * math.exp(-K_MEAN * sig0)
+            string mp = f_pct(f_touch(K_MEAN * sig0, sig0))
+            string mUt = sessH >= mU ? "Mean ↑ " + mp + "  hit" : "Mean ↑ " + mp + "  now " + f_pct(f_touch(math.log(mU / close), sigRem))
+            string mDt = sessL <= mD ? "Mean ↓ " + mp + "  hit" : "Mean ↓ " + mp + "  now " + f_pct(f_touch(math.log(close / mD), sigRem))
+            array.push(lbls, f_lbl(mU, mUt, cMean))
+            array.push(lbls, f_lbl(mD, mDt, cMean))
+
+        if showHL and not na(sigRem)
+            float pH = f_touch(math.log((sessH + syminfo.mintick) / close), sigRem)
+            float pL = f_touch(math.log(close / (sessL - syminfo.mintick)), sigRem)
+            array.push(lbls, f_lbl(sessH, "Session H taken: " + f_pct(pH), cUp))
+            array.push(lbls, f_lbl(sessL, "Session L taken: " + f_pct(pL), cDn))
+
+
+// ============================================================================
+// CALIBRATION TABLE
+// ============================================================================
+
+var table cal = table.new(position.bottom_right, 4, 4, bgcolor = color.new(color.black, 20), border_width = 1)
+
+if showCal and barstate.islast
+    table.cell(cal, 0, 0, "Model p",  text_color = color.white, text_size = size.small)
+    table.cell(cal, 1, 0, "Sessions", text_color = color.white, text_size = size.small)
+    table.cell(cal, 2, 0, "Up hit",   text_color = cUp,         text_size = size.small)
+    table.cell(cal, 3, 0, "Down hit", text_color = cDn,         text_size = size.small)
+    for k = 0 to 2
+        int   n  = array.get(calN, k)
+        float hu = n > 0 ? array.get(calUp, k) / float(n) : na
+        float hd = n > 0 ? array.get(calDn, k) / float(n) : na
+        table.cell(cal, 0, k + 1, str.tostring(array.get(pArr, k), "#.#") + "%", text_color = color.white, text_size = size.small)
+        table.cell(cal, 1, k + 1, str.tostring(n), text_color = color.white, text_size = size.small)
+        table.cell(cal, 2, k + 1, f_pct(hu), text_color = color.white, text_size = size.small)
+        table.cell(cal, 3, k + 1, f_pct(hd), text_color = color.white, text_size = size.small)
